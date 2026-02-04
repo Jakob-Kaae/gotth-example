@@ -46,3 +46,5 @@ templ-generate:
 templ-watch:
 	templ generate --watch
 
+.PHONY: init
+init: go-install-air get-install-tailwindcss go-install-templ ## initialize the development environment
