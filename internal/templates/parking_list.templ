@@ -1,0 +1,17 @@
+package templates
+
+import "github.com/Jakob-Kaae/gotth-example/internal/parking/domain/model"
+
+templ ParkingList(spots []model.ParkingSpot) {
+    if len(spots) > 0 {
+        <div id="parking-list" class="mt-4 grid gap-4 sm:grid-cols-2 md:mt-8">
+            for _, spot := range spots {
+                @ParkingSpot(spot.Name, spot.FreeSpots)
+            }
+        </div>
+    } else {
+        <p class="mt-4 text-gray-500 md:mt-8 dark:text-gray-400">
+            No parking spots available at the moment.
+        </p>
+    }
+}

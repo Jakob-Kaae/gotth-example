@@ -1,4 +1,4 @@
-module github.com/sigrdrifa/gotth-example
+module github.com/Jakob-Kaae/gotth-example
 
 go 1.23.2
 

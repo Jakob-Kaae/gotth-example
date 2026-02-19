@@ -1,43 +1,48 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
-	"github.com/sigrdrifa/gotth-example/internal/store"
-	"github.com/sigrdrifa/gotth-example/internal/templates"
+	"github.com/Jakob-Kaae/gotth-example/internal/parking/application/service"
+	"github.com/Jakob-Kaae/gotth-example/internal/parking/domain/model"
+	"github.com/Jakob-Kaae/gotth-example/internal/parking/infrastructure/httpclient"
+	parkingStore "github.com/Jakob-Kaae/gotth-example/internal/parking/infrastructure/store"
+	"github.com/Jakob-Kaae/gotth-example/internal/parking/interface/httpinterface"
+	"github.com/Jakob-Kaae/gotth-example/internal/templates"
 )
 
-type GuestStore interface {
-	AddGuest(guest store.Guest) error
-	GetGuests() ([]store.Guest, error)
-}
-
 type server struct {
-	logger     *log.Logger
-	port       int
-	httpServer *http.Server
-	guestDb    GuestStore
+	logger       *log.Logger
+	port         int
+	httpServer   *http.Server
+	parkingStore *parkingStore.InMemoryParkingStore
+	apiClient    *httpclient.ParkingAPIClient
+	sseClients   map[chan string]struct{}
+	sseClientsMu sync.Mutex
 }
 
 // Creat a new server instance with the given logger and port
-func NewServer(logger *log.Logger, port int, guestDb GuestStore) (*server, error) {
+func NewServer(logger *log.Logger, port int, apiClient *httpclient.ParkingAPIClient) (*server, error) {
 	if logger == nil {
 		return nil, fmt.Errorf("logger is required")
 	}
-	if guestDb == nil {
-		return nil, fmt.Errorf("guestDb is required")
-	}
+
 	return &server{
-		logger:  logger,
-		port:    port,
-		guestDb: guestDb}, nil
+		logger:       logger,
+		port:         port,
+		parkingStore: parkingStore.NewInMemoryParkingStore(),
+		apiClient:    apiClient,
+		sseClients:   make(map[chan string]struct{}),
+	}, nil
 }
 
 // Start the server
@@ -54,9 +59,27 @@ func (s *server) Start() error {
 	router.HandleFunc("GET /", s.defaultHandler)
 	router.HandleFunc("GET /about", s.aboutHandler)
 	router.HandleFunc("GET /health", s.healthCheckHandler)
-	router.HandleFunc("POST /guests", s.addGuestHandler)
-	router.HandleFunc("GET /guests", s.getGuestsHandler)
-	router.HandleFunc("GET /signup", s.getSignupHandler)
+	// Interface
+	handler := httpinterface.NewParkingHandler(s.parkingStore)
+	router.HandleFunc("GET /parking", handler.GetParkingSpots)
+	router.HandleFunc("GET /events/parking", s.parkingSSE)
+	s.parkingStore.OnChange(func(spots []model.ParkingSpot) {
+		s.broadcastParkingUpdate(spots)
+	})
+
+	// Application
+	pollService := service.NewPollParkingSpotsService(s.apiClient, s.parkingStore)
+
+	// Start polling loop
+	go func() {
+		for {
+			err := pollService.Poll()
+			if err != nil {
+				s.logger.Printf("Error polling parking spots: %v", err)
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}()
 
 	// define server
 	s.httpServer = &http.Server{
@@ -85,8 +108,9 @@ func (s *server) Start() error {
 // GET /
 func (s *server) defaultHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	homeTemplate := templates.Home()
-	err := templates.Layout(homeTemplate, "Spooktober party", "/").Render(r.Context(), w)
+	parkingSpots := s.parkingStore.GetAll()
+	homeTemplate := templates.Home(parkingSpots)
+	err := templates.Layout(homeTemplate, "Parking Tracker", "/").Render(r.Context(), w)
 	if err != nil {
 		s.logger.Printf("Error when rendering home: %v", err)
 	}
@@ -101,59 +125,32 @@ func (s *server) aboutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *server) broadcastParkingUpdate(spots []model.ParkingSpot) {
+	// Render Templ component to HTML
+	var buf bytes.Buffer
+	err := templates.ParkingList(spots).Render(context.Background(), &buf)
+	if err != nil {
+		s.logger.Printf("failed to render parking list: %v", err)
+		return
+	}
+	html := buf.String()
+
+	// Send to all SSE clients
+	s.sseClientsMu.Lock()
+	defer s.sseClientsMu.Unlock()
+
+	for ch := range s.sseClients {
+		select {
+		case ch <- html:
+		default:
+			// slow client, drop update
+		}
+	}
+
+}
+
 // GET /health - HealthCheckHandler is a simple handler to check the health of the server
 func (s *server) healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
-}
-
-// AddGuestHandler is a handler to add a guest to the guest store
-func (s *server) addGuestHandler(w http.ResponseWriter, r *http.Request) {
-	payload, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.logger.Printf("Error when reading request body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	guest, err := store.DecodeGuest(payload)
-	if err != nil {
-		s.logger.Printf("Error when decoding guest: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	if err := s.guestDb.AddGuest(guest); err != nil {
-		s.logger.Printf("Error when adding guest: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	guests, err := s.guestDb.GetGuests()
-	if err != nil {
-		s.logger.Printf("Error when getting guests: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	templates.Guests(guests, true).Render(r.Context(), w)
-
-}
-
-// GetGuestsHandler is a handler to get all guests from the guest store
-func (s *server) getGuestsHandler(w http.ResponseWriter, r *http.Request) {
-	guests, err := s.guestDb.GetGuests()
-	if err != nil {
-		s.logger.Printf("Error when getting guests: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	for _, guest := range guests {
-		w.Write([]byte(fmt.Sprintf("Name: %s, Email: %s\n", guest.Name, guest.Email)))
-	}
-}
-
-func (s *server) getSignupHandler(w http.ResponseWriter, r *http.Request) {
-	templates.Signup().Render(r.Context(), w)
 }
